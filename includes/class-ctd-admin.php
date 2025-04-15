@@ -34,7 +34,7 @@ class CTD_Admin {
                     <?php $this->render_rules_table(); ?>
                 </div>
 
-                <div class="ctd-rule-editor" style="display: none;">
+                <div class="ctd-rule-editor" style="display: none;" data-id="">
                     <?php $this->render_rule_editor(); ?>
                 </div>
             </div>
@@ -127,7 +127,7 @@ class CTD_Admin {
                 <h3><?php esc_html_e('Apply to Categories', 'custom-tshirt-discount'); ?></h3>
                 <div class="ctd-checkbox-group">
                     <?php
-                    $categories = get_terms('product_cat', ['hide_empty' => false]);
+                    $categories = get_terms(['taxonomy' => 'product_cat', 'hide_empty' => false]);
                     foreach ($categories as $cat) :
                     ?>
                         <label>
@@ -161,99 +161,94 @@ class CTD_Admin {
 
     public function save_rule_ajax() {
         try {
-            if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'ctd_admin_nonce')) {
-                throw new Exception('Security check failed');
-            }
+            check_ajax_referer('ctd_admin_nonce', 'nonce');
 
             if (!current_user_can('manage_options')) {
-                throw new Exception('Permission denied');
+                throw new Exception(__('Permission denied', 'custom-tshirt-discount'));
             }
-            
-            
-             // Decode and validate categories
-        $categories = json_decode(wp_unslash($_POST['categories']), true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid categories data');
-        }
 
-        // Decode and validate excluded products
-        $excluded_products = json_decode(wp_unslash($_POST['excluded_products']), true);
-        if (json_last_error() !== JSON_ERROR_NONE) {
-            throw new Exception('Invalid excluded products data');
-        }
+            // Validate required fields
+            if (empty($_POST['name']) || empty($_POST['quantity']) || !isset($_POST['discount_price'])) {
+                throw new Exception(__('Please fill in all required fields', 'custom-tshirt-discount'));
+            }
 
-
+            // Validate categories
+            if (empty($_POST['categories'])) {
+                throw new Exception(__('Please select at least one category', 'custom-tshirt-discount'));
+            }
 
             $data = [
                 'name' => sanitize_text_field($_POST['name']),
                 'quantity' => intval($_POST['quantity']),
                 'discount_price' => floatval($_POST['discount_price']),
-                'categories' => sanitize_text_field($_POST['categories']),
-                'excluded_products' => sanitize_text_field($_POST['excluded_products'])
+                'categories' => wp_json_encode(array_map('absint', $_POST['categories'])),
+                'excluded_products' => wp_json_encode(
+                    isset($_POST['excluded_products']) ? array_map('absint', $_POST['excluded_products']) : []
+                )
             ];
 
-            if (isset($_POST['rule_id'])) {
+            if (!empty($_POST['rule_id'])) {
                 $data['rule_id'] = intval($_POST['rule_id']);
             }
 
             $result = CTD_DB::save_rule($data);
 
             if ($result === false) {
-                throw new Exception('Failed to save rule');
+                throw new Exception(__('Failed to save rule', 'custom-tshirt-discount'));
             }
 
-            wp_send_json_success(['message' => 'Rule saved successfully']);
+            wp_send_json_success(['message' => __('Rule saved successfully', 'custom-tshirt-discount')]);
 
         } catch (Exception $e) {
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(['message' => $e->getMessage()]);
         }
     }
 
     public function get_rule_ajax() {
         try {
-            if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'ctd_admin_nonce')) {
-                throw new Exception('Security check failed');
-            }
+            check_ajax_referer('ctd_admin_nonce', 'nonce');
 
             if (!current_user_can('manage_options')) {
-                throw new Exception('Permission denied');
+                throw new Exception(__('Permission denied', 'custom-tshirt-discount'));
             }
 
             $rule_id = isset($_POST['id']) ? intval($_POST['id']) : 0;
             $rule = CTD_DB::get_rule($rule_id);
 
             if (!$rule) {
-                throw new Exception('Rule not found');
+                throw new Exception(__('Rule not found', 'custom-tshirt-discount'));
             }
+
+            // Ensure categories and excluded products are valid JSON
+            $rule->categories = json_decode($rule->categories) ? $rule->categories : '[]';
+            $rule->excluded_products = json_decode($rule->excluded_products) ? $rule->excluded_products : '[]';
 
             wp_send_json_success($rule);
 
         } catch (Exception $e) {
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(['message' => $e->getMessage()]);
         }
     }
 
     public function delete_rule_ajax() {
         try {
-            if (!isset($_POST['nonce']) || !wp_verify_nonce($_POST['nonce'], 'ctd_admin_nonce')) {
-                throw new Exception('Security check failed');
-            }
+            check_ajax_referer('ctd_admin_nonce', 'nonce');
 
             if (!current_user_can('manage_options')) {
-                throw new Exception('Permission denied');
+                throw new Exception(__('Permission denied', 'custom-tshirt-discount'));
             }
 
             $rule_id = isset($_POST['id']) ? intval($_POST['id']) : 0;
             $result = CTD_DB::delete_rule($rule_id);
 
             if ($result === false) {
-                throw new Exception('Failed to delete rule');
+                throw new Exception(__('Failed to delete rule', 'custom-tshirt-discount'));
             }
 
-            wp_send_json_success(['message' => 'Rule deleted successfully']);
+            wp_send_json_success(['message' => __('Rule deleted successfully', 'custom-tshirt-discount')]);
 
         } catch (Exception $e) {
-            wp_send_json_error($e->getMessage());
+            wp_send_json_error(['message' => $e->getMessage()]);
         }
     }
 }
