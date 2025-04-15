@@ -29,9 +29,12 @@ function ctd_init() {
     // Add price calculation
     add_action('woocommerce_before_calculate_totals', 'ctd_calculate_prices', 99);
     
-    // Add AJAX handlers
+    // Add AJAX handlers for both logged in and non-logged in users
     add_action('wp_ajax_ctd_add_to_cart', 'ctd_handle_add_to_cart');
     add_action('wp_ajax_nopriv_ctd_add_to_cart', 'ctd_handle_add_to_cart');
+    
+    // Add WooCommerce AJAX handlers
+    add_action('wc_ajax_add_to_cart', 'ctd_handle_add_to_cart');
 }
 add_action('plugins_loaded', 'ctd_init');
 
@@ -55,92 +58,104 @@ function ctd_calculate_prices($cart) {
     if (did_action('woocommerce_before_calculate_totals') >= 2) {
         return;
     }
-    
-          try {
-        // Reset all prices to original first (NEW)
+
+    try {
+        // Reset all prices to original first
         foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
             if (isset($cart_item['original_price'])) {
                 $cart_item['data']->set_price($cart_item['original_price']);
             }
         }
-        
-      
 
-       // Store original prices (corrected)
-foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
-    if (!isset($cart_item['original_price'])) {
-        $cart->cart_contents[$cart_item_key]['original_price'] = $cart_item['data']->get_price();
-    }
-}
+        // Get all active rules
+        $rules = CTD_DB::get_all_rules();
+        if (empty($rules)) {
+            return;
+        }
 
-
-  $rules = CTD_DB::get_all_rules(); // Add this line
-
-
-        foreach ($rules as $rule) {
-            $categories = json_decode($rule->categories, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                continue;
+        // Store original prices and group items by rule eligibility
+        $eligible_items = [];
+        foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
+            if (!isset($cart_item['original_price'])) {
+                $cart_item['original_price'] = $cart_item['data']->get_price();
+                $cart->cart_contents[$cart_item_key]['original_price'] = $cart_item['original_price'];
             }
 
-            $excluded_products = json_decode($rule->excluded_products, true);
-            if (json_last_error() !== JSON_ERROR_NONE) {
-                continue;
+            $product_id = $cart_item['product_id'];
+            $product_cats = wp_get_post_terms($product_id, 'product_cat', ['fields' => 'ids']);
+            
+            // Include parent categories
+            foreach ($product_cats as $cat_id) {
+                $ancestors = get_ancestors($cat_id, 'product_cat');
+                $product_cats = array_merge($product_cats, $ancestors);
             }
+            $product_cats = array_unique($product_cats);
 
-            // Group eligible items
-            $eligible_items = [];
-            foreach ($cart->get_cart() as $cart_item_key => $cart_item) {
-                $product_id = $cart_item['product_id'];
-                // custom-tshirt-discount.php (ctd_calculate_prices)
-$product_cats = [];
-$terms = wp_get_post_terms($product_id, 'product_cat', ['fields' => 'all']);
-foreach ($terms as $term) {
-    $product_cats[] = $term->term_id;
-    $ancestors = get_ancestors($term->term_id, 'product_cat');
-    $product_cats = array_merge($product_cats, $ancestors);
-}
-$product_cats = array_unique($product_cats);
+            // Check each rule
+            foreach ($rules as $rule) {
+                $rule_categories = json_decode($rule->categories, true);
+                $excluded_products = json_decode($rule->excluded_products, true) ?: [];
 
-                if (!is_wp_error($product_cats) && 
-                    !in_array($product_id, $excluded_products) && 
-                    array_intersect($categories, $product_cats)) {
+                // Skip if product is excluded
+                if (in_array($product_id, $excluded_products)) {
+                    continue;
+                }
+
+                // Check if product belongs to any of the rule categories
+                if (array_intersect($product_cats, $rule_categories)) {
+                    if (!isset($eligible_items[$rule->rule_id])) {
+                        $eligible_items[$rule->rule_id] = [];
+                    }
                     
+                    // Add item multiple times based on quantity
                     for ($i = 0; $i < $cart_item['quantity']; $i++) {
-                        $eligible_items[] = [
+                        $eligible_items[$rule->rule_id][] = [
                             'key' => $cart_item_key,
-                            'product_id' => $product_id,
-                            'original_price' => $cart_item['original_price']
+                            'price' => $cart_item['original_price']
                         ];
                     }
                 }
             }
+        }
 
-            // Apply special pricing to sets
-            $total_items = count($eligible_items);
+        // Apply discounts for each rule
+        foreach ($rules as $rule) {
+            if (!isset($eligible_items[$rule->rule_id])) {
+                continue;
+            }
+
+            $items = $eligible_items[$rule->rule_id];
+            $total_items = count($items);
             $sets = floor($total_items / $rule->quantity);
 
             if ($sets > 0) {
                 $items_in_sets = $sets * $rule->quantity;
-                $price_per_item = $rule->discount_price / $rule->quantity;
+                $discount_per_item = $rule->discount_price / $rule->quantity;
 
-                // Track processed items
-                $processed_counts = [];
+                // Track how many items we've discounted for each cart item
+                $discounted_counts = [];
 
-                // Apply special price to items in complete sets
+                // Apply discount to items in complete sets
                 for ($i = 0; $i < $items_in_sets; $i++) {
-                    $item = $eligible_items[$i];
+                    $item = $items[$i];
                     $cart_item_key = $item['key'];
 
-                    if (!isset($processed_counts[$cart_item_key])) {
-                        $processed_counts[$cart_item_key] = 0;
+                    if (!isset($discounted_counts[$cart_item_key])) {
+                        $discounted_counts[$cart_item_key] = 0;
                     }
 
                     $cart_item = $cart->get_cart_item($cart_item_key);
-                    $processed_counts[$cart_item_key]++;
+                    $discounted_counts[$cart_item_key]++;
 
-                    if ($processed_counts[$cart_item_key] <= $cart_item['quantity']) {
-                        $cart_item['data']->set_price($price_per_item);
+                    // Calculate how many items should be discounted
+                    $items_to_discount = min(
+                        $discounted_counts[$cart_item_key],
+                        $cart_item['quantity']
+                    );
+
+                    if ($items_to_discount > 0) {
+                        // Set the new price
+                        $cart_item['data']->set_price($discount_per_item);
                     }
                 }
             }
@@ -152,53 +167,71 @@ $product_cats = array_unique($product_cats);
 
 // Handle AJAX add to cart
 function ctd_handle_add_to_cart() {
+    // Prevent any output before our JSON response
+    @ob_clean();
+    
+    header('Content-Type: application/json');
+
     try {
-        check_ajax_referer('wc-ajax', 'security');
-
-        $product_id = isset($_POST['product_id']) ? absint($_POST['product_id']) : 0;
-        $quantity = isset($_POST['quantity']) ? wc_stock_amount($_POST['quantity']) : 1;
-        $variation_id = isset($_POST['variation_id']) ? absint($_POST['variation_id']) : 0;
-        $variations = isset($_POST['variation']) ? (array) $_POST['variation'] : [];
-
-        // Sanitize variations
-        foreach ($variations as $key => $value) {
-            $variations[$key] = wc_clean($value);
+        // Verify nonce for security
+        if (!check_ajax_referer('woocommerce-add-to-cart', 'security', false)) {
+            throw new Exception(__('Security check failed', 'woocommerce'));
         }
 
-        $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity, $variation_id, $variations);
+        $product_id = apply_filters('woocommerce_add_to_cart_product_id', absint($_POST['product_id']));
+        $quantity = empty($_POST['quantity']) ? 1 : wc_stock_amount(wp_unslash($_POST['quantity']));
+        $variation_id = empty($_POST['variation_id']) ? 0 : absint($_POST['variation_id']);
+        $passed_validation = apply_filters('woocommerce_add_to_cart_validation', true, $product_id, $quantity);
+        $product_status = get_post_status($product_id);
 
-        if ($passed_validation && WC()->cart->add_to_cart($product_id, $quantity, $variation_id, $variations)) {
-            do_action('woocommerce_ajax_added_to_cart', $product_id);
+        if ($passed_validation && WC()->cart && 'publish' === $product_status) {
+            // Get variation data
+            $variation = [];
+            if ($variation_id) {
+                foreach ($_POST as $key => $value) {
+                    if (strpos($key, 'attribute_') === 0) {
+                        $variation[sanitize_title(wp_unslash($key))] = wp_unslash($value);
+                    }
+                }
+            }
 
-            // Get mini cart HTML
-            ob_start();
-            woocommerce_mini_cart();
-            $mini_cart = ob_get_clean();
+            $cart_item_key = WC()->cart->add_to_cart($product_id, $quantity, $variation_id, $variation);
 
-            // Fragments and cart hash
-            $data = [
-                'fragments' => apply_filters(
-                    'woocommerce_add_to_cart_fragments',
-                    [
-                        'div.widget_shopping_cart_content' => '<div class="widget_shopping_cart_content">' . $mini_cart . '</div>'
-                    ]
-                ),
-                'cart_hash' => WC()->cart->get_cart_hash()
-            ];
+            if ($cart_item_key) {
+                do_action('woocommerce_ajax_added_to_cart', $product_id);
 
-            wp_send_json_success($data);
+                // Get mini cart HTML
+                ob_start();
+                woocommerce_mini_cart();
+                $mini_cart = ob_get_clean();
+
+                // Prepare response data
+                $data = array(
+                    'error' => false,
+                    'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink($product_id), $product_id),
+                    'fragments' => apply_filters(
+                        'woocommerce_add_to_cart_fragments',
+                        array(
+                            'div.widget_shopping_cart_content' => '<div class="widget_shopping_cart_content">' . $mini_cart . '</div>'
+                        )
+                    ),
+                    'cart_hash' => WC()->cart->get_cart_hash()
+                );
+
+                wp_send_json($data);
+            } else {
+                throw new Exception(__('Error adding product to cart.', 'woocommerce'));
+            }
         } else {
-            wp_send_json_error([
-                'error' => __('Error adding product to cart.', 'woocommerce')
-            ]);
+            throw new Exception(__('Product cannot be purchased.', 'woocommerce'));
         }
     } catch (Exception $e) {
-        wp_send_json_error([
-            'error' => $e->getMessage()
-        ]);
+        wp_send_json(array(
+            'error' => true,
+            'message' => $e->getMessage(),
+            'product_url' => apply_filters('woocommerce_cart_redirect_after_error', get_permalink($product_id), $product_id)
+        ));
     }
-
-    wp_die();
 }
 
 // Add compatibility filter for WooCommerce AJAX
@@ -222,9 +255,3 @@ function ctd_init_ajax_handling() {
     }
 }
 add_action('init', 'ctd_init_ajax_handling', 0);
-
-// Add custom AJAX endpoint
-function ctd_add_ajax_events() {
-    add_rewrite_endpoint('ctd-ajax', EP_ALL);
-}
-add_action('init', 'ctd_add_ajax_events');
